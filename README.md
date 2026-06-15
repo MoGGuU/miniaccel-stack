@@ -36,12 +36,9 @@ Guest 串口日志写入 `build/guest/serial.log`。QEMU monitor socket 位于
 ## QEMU 源码仓库
 
 同级目录 `../miniaccel-qemu` 是 `qemu/qemu` 的本地克隆，当前分支为
-`miniaccel`，暂未修改源码。要完成 GitHub 上的 Fork，在 GitHub 网页点击
-`qemu/qemu` 的 **Fork**，然后将本地 `origin` 改为自己的仓库，并把上游保留为
-`upstream`：
+`miniaccel`，暂未修改源码。Git remote 配置如下：
 
 ```bash
-git -C ../miniaccel-qemu remote rename origin upstream
-git -C ../miniaccel-qemu remote add origin git@github.com:<你的用户名>/qemu.git
-git -C ../miniaccel-qemu push -u origin miniaccel
+origin    git@github.com:MoGGuU/qemu.git
+upstream  https://github.com/qemu/qemu.git
 ```
