@@ -1,0 +1,7 @@
+Host miniaccel
+    HostName 127.0.0.1
+    Port 2222
+    User miniaccel
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    LogLevel ERROR
