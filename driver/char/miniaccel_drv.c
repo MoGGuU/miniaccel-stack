@@ -1,0 +1,67 @@
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/pci.h>
+
+#define DRV_NAME "miniaccel_drv"
+
+/* ---------- 1. PCI ID 表 ---------- */
+/* 列出本驱动匹配的 vendor/device。pci_device_id 数组必须以全零项结尾。 */
+static const struct pci_device_id miniaccel_id_table[] = {
+	{ PCI_DEVICE(0x1234, 0x11e8) },	/* QEMU EDU */
+	{ 0, }				/* sentinel */
+};
+MODULE_DEVICE_TABLE(pci, miniaccel_id_table);
+
+/* ---------- 2. probe: 设备匹配成功后调用 ---------- */
+/* 返回 0 = 成功绑定; 负数 = 失败, core 会继续找别的驱动 */
+static int miniaccel_probe(struct pci_dev *pdev,
+			   const struct pci_device_id *id)
+{
+	dev_info(&pdev->dev, "probe called for %04x:%04x\n",
+		 pdev->vendor, pdev->device);
+
+	/* 暂时不调用 pci_enable_device(), 不 request BAR, 不 ioremap.
+	 * 仅打印 BDF/vendor/device 确认匹配成功.
+	 */
+
+	return 0;  /* 返回 0 = 接受绑定. 关键. */
+}
+
+/* ---------- 3. remove: rmmod 或设备热拔时调用 ---------- */
+static void miniaccel_remove(struct pci_dev *pdev)
+{
+	dev_info(&pdev->dev, "remove called for %04x:%04x\n",
+		 pdev->vendor, pdev->device);
+
+	/* 此处应释放 probe 中申请的资源. 当前 probe 没申请, 也就无需释放. */
+}
+
+/* ---------- 4. pci_driver 结构 ---------- */
+/* 把 probe/remove/id_table 装到一起, 给 pci_register_driver 用. */
+static struct pci_driver miniaccel_driver = {
+	.name		= DRV_NAME,
+	.id_table	= miniaccel_id_table,
+	.probe		= miniaccel_probe,
+	.remove		= miniaccel_remove,
+};
+
+/* ---------- 5. 模块入口 / 出口 ---------- */
+static int __init miniaccel_drv_init(void)
+{
+	pr_info("%s: module_init\n", DRV_NAME);
+	return pci_register_driver(&miniaccel_driver);
+}
+
+static void __exit miniaccel_drv_exit(void)
+{
+	pci_unregister_driver(&miniaccel_driver);
+	pr_info("%s: module_exit\n", DRV_NAME);
+}
+
+module_init(miniaccel_drv_init);
+module_exit(miniaccel_drv_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("MiniAccel");
+MODULE_DESCRIPTION("Minimal PCI driver skeleton for QEMU EDU (1234:11e8)");
+MODULE_VERSION("0.1");

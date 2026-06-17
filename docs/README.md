@@ -9,6 +9,7 @@
 
 - [第 1 周 Day 1：环境搭建](week-01-environment.md)
 - [第 1 周 Day 2：PCI 枚举与驱动匹配](week-01-pci.md)
+- [第 1 周 Day 3-5：KMD probe/remove 与绑定测试](week-01-probe.md)
 
 ## 源码阅读笔记
 
