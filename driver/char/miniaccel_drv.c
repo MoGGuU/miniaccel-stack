@@ -1,8 +1,13 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/pci.h>
+#include <linux/slab.h>
 
 #define DRV_NAME "miniaccel_drv"
+
+struct miniaccel_dev {
+	struct pci_dev *pdev;
+};
 
 /* ---------- 1. PCI ID 表 ---------- */
 /* 列出本驱动匹配的 vendor/device。pci_device_id 数组必须以全零项结尾。 */
@@ -17,23 +22,33 @@ MODULE_DEVICE_TABLE(pci, miniaccel_id_table);
 static int miniaccel_probe(struct pci_dev *pdev,
 			   const struct pci_device_id *id)
 {
+	struct miniaccel_dev *mdev;
+
+	mdev = kzalloc(sizeof(*mdev), GFP_KERNEL);
+	if (!mdev) {
+		dev_err(&pdev->dev, "failed to allocate private data\n");
+		return -ENOMEM;
+	}
+
+	mdev->pdev = pdev;
+	pci_set_drvdata(pdev, mdev);
+
 	dev_info(&pdev->dev, "probe called for %04x:%04x\n",
 		 pdev->vendor, pdev->device);
 
-	/* 暂时不调用 pci_enable_device(), 不 request BAR, 不 ioremap.
-	 * 仅打印 BDF/vendor/device 确认匹配成功.
-	 */
-
-	return 0;  /* 返回 0 = 接受绑定. 关键. */
+	return 0;
 }
 
 /* ---------- 3. remove: rmmod 或设备热拔时调用 ---------- */
 static void miniaccel_remove(struct pci_dev *pdev)
 {
+	struct miniaccel_dev *mdev = pci_get_drvdata(pdev);
+
+	pci_set_drvdata(pdev, NULL);
+	kfree(mdev);
+
 	dev_info(&pdev->dev, "remove called for %04x:%04x\n",
 		 pdev->vendor, pdev->device);
-
-	/* 此处应释放 probe 中申请的资源. 当前 probe 没申请, 也就无需释放. */
 }
 
 /* ---------- 4. pci_driver 结构 ---------- */
@@ -48,8 +63,16 @@ static struct pci_driver miniaccel_driver = {
 /* ---------- 5. 模块入口 / 出口 ---------- */
 static int __init miniaccel_drv_init(void)
 {
+	int ret;
+
 	pr_info("%s: module_init\n", DRV_NAME);
-	return pci_register_driver(&miniaccel_driver);
+
+	ret = pci_register_driver(&miniaccel_driver);
+	if (ret)
+		pr_err("%s: failed to register PCI driver: %d\n",
+		       DRV_NAME, ret);
+
+	return ret;
 }
 
 static void __exit miniaccel_drv_exit(void)

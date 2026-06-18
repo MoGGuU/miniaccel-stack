@@ -1,8 +1,9 @@
-# 第 1 周 Day 3-5 SOP：KMD probe/remove 与绑定测试
+# 第 1 周 Day 3-6 SOP：KMD probe/remove、绑定测试与私有结构
 
-本文记录 MiniAccel 第 1 周 Day 3、Day 4、Day 5 的实际执行过程：创建
+本文记录 MiniAccel 第 1 周 Day 3 至 Day 6 的实际执行过程：创建
 out-of-tree Linux kernel module，注册最小 PCI driver，匹配 QEMU EDU
-设备 `1234:11e8`，并把手工加载/卸载验证固化成脚本。
+设备 `1234:11e8`，把手工加载/卸载验证固化成脚本，并建立每个 PCI 设备
+独立的私有数据结构。
 
 最终验收结果：
 
@@ -13,12 +14,15 @@ out-of-tree Linux kernel module，注册最小 PCI driver，匹配 QEMU EDU
 4. `tests/probe/test_bind_unbind.sh` 通过。
 5. `tests/probe/test_reload_100.sh` 完成 100 次 reload，没有看到近期
    `Oops`、`BUG`、`WARNING`、`Call Trace` 或 `panic`。
+6. `probe()` 为设备分配 `struct miniaccel_dev`，通过 drvdata 保存并在
+   `remove()` 中释放。
+7. Day 6 版本通过 `make W=1` 和 100 次 reload 验证。
 
 ## 1. 当前上下文
 
 ### 1.0 实际执行记录
 
-执行日期：2026-06-17
+执行日期：2026-06-17 至 2026-06-18
 
 宿主机与 Guest：
 
@@ -31,7 +35,7 @@ out-of-tree Linux kernel module，注册最小 PCI driver，匹配 QEMU EDU
 | EDU BDF | `00:02.0` |
 | EDU PCI ID | `1234:11e8` |
 
-本次是否完整跑通：是。Day 3、Day 4、Day 5 都在 Guest 内实际执行过。
+本次是否完整跑通：是。Day 3 至 Day 6 都在 Guest 内实际执行过。
 
 未执行或阻塞项：
 
@@ -65,9 +69,13 @@ Host: scripts/run-qemu.sh
   -> pci_register_driver(&miniaccel_driver)
   -> pci_device_id 匹配 1234:11e8
   -> miniaccel_probe()
+  -> kzalloc(struct miniaccel_dev)
+  -> pci_set_drvdata()
   -> lspci -nnk 显示 Kernel driver in use: miniaccel_drv
   -> rmmod miniaccel_drv
   -> miniaccel_remove()
+  -> pci_get_drvdata()
+  -> kfree(struct miniaccel_dev)
 ```
 
 ## 3. Day 3：创建最小 out-of-tree KMD
@@ -321,7 +329,135 @@ no-recent-oops-warning-panic
 - 100 次 reload 完成。
 - 近期内核日志没有发现明显异常。
 
-## 6. 踩坑与修正
+## 6. Day 6：设备私有结构和日志整理
+
+### 6.1 定义每设备私有结构
+
+驱动新增：
+
+```c
+struct miniaccel_dev {
+	struct pci_dev *pdev;
+};
+```
+
+这份结构属于单个 PCI 设备实例。后续 BAR 映射地址、中断状态和 DMA
+资源都可以继续放进该结构，避免使用只能服务一个设备的全局变量。
+
+### 6.2 在 probe 中分配并保存
+
+`probe()` 中的关键流程：
+
+```c
+struct miniaccel_dev *mdev;
+
+mdev = kzalloc(sizeof(*mdev), GFP_KERNEL);
+if (!mdev) {
+	dev_err(&pdev->dev, "failed to allocate private data\n");
+	return -ENOMEM;
+}
+
+mdev->pdev = pdev;
+pci_set_drvdata(pdev, mdev);
+```
+
+验收答案：
+
+- 使用 `kzalloc()` 分配并清零私有结构。
+- 分配失败时不会解引用空指针，而是记录设备错误并返回 `-ENOMEM`。
+- `pci_set_drvdata()` 把私有结构和当前 `pdev` 关联。
+
+### 6.3 在 remove 中取回并释放
+
+`remove()` 中的关键流程：
+
+```c
+struct miniaccel_dev *mdev = pci_get_drvdata(pdev);
+
+pci_set_drvdata(pdev, NULL);
+kfree(mdev);
+```
+
+验收答案：
+
+- `pci_get_drvdata()` 能取回 `probe()` 保存的同一指针。
+- drvdata 在释放前被清空。
+- 内核内存使用 `kfree()` 释放；`kfree(NULL)` 本身也是安全的。
+
+### 6.4 日志整理
+
+有具体设备上下文的路径使用：
+
+```c
+dev_info(&pdev->dev, ...);
+dev_err(&pdev->dev, ...);
+```
+
+日志会自动包含驱动名和 BDF：
+
+```text
+miniaccel_drv 0000:00:02.0: probe called for 1234:11e8
+miniaccel_drv 0000:00:02.0: remove called for 1234:11e8
+```
+
+模块入口和出口没有具体 `struct device`，继续使用 `pr_info()` /
+`pr_err()`。
+
+### 6.5 W=1 编译验证
+
+本次把当前源码同步到 Guest 临时目录后执行：
+
+```bash
+cd ~/miniaccel-day6-review
+make clean
+make W=1
+```
+
+实际输出摘录：
+
+```text
+make -C /lib/modules/6.1.0-49-cloud-amd64/build M=/home/miniaccel/miniaccel-day6-review modules
+make[1]: Entering directory '/usr/src/linux-headers-6.1.0-49-cloud-amd64'
+  CC [M]  /home/miniaccel/miniaccel-day6-review/miniaccel_drv.o
+  MODPOST /home/miniaccel/miniaccel-day6-review/Module.symvers
+  CC [M]  /home/miniaccel/miniaccel-day6-review/miniaccel_drv.mod.o
+  LD [M]  /home/miniaccel/miniaccel-day6-review/miniaccel_drv.ko
+  BTF [M] /home/miniaccel/miniaccel-day6-review/miniaccel_drv.ko
+Skipping BTF generation for /home/miniaccel/miniaccel-day6-review/miniaccel_drv.ko due to unavailability of vmlinux
+make[1]: Leaving directory '/usr/src/linux-headers-6.1.0-49-cloud-amd64'
+```
+
+验收：
+
+- `W=1` 编译成功。
+- 没有 C 代码 warning。
+- `.ko` 正常生成。
+
+### 6.6 生命周期回归验证
+
+编译后执行 100 次加载/卸载：
+
+```bash
+for i in $(seq 1 100); do
+	sudo insmod ./miniaccel_drv.ko
+	sudo rmmod miniaccel_drv
+done
+```
+
+实际输出：
+
+```text
+reload-100-ok
+no-recent-oops-warning-panic
+```
+
+验收：
+
+- 100 次 `probe()` / `remove()` 生命周期完成。
+- 没有发现私有结构重复释放或未释放导致的明显内核异常。
+- 最近内核日志没有 `Oops`、`BUG`、`WARNING`、`Call Trace` 或 `panic`。
+
+## 7. 踩坑与修正
 
 | 问题 | 现象 | 原因 | 修正 |
 |---|---|---|---|
@@ -330,8 +466,11 @@ no-recent-oops-warning-panic
 | 模块名写法不统一 | 文档命令可能写成 `miniaccel.ko` / `rmmod miniaccel` | `obj-m := miniaccel_drv.o` 决定模块名是 `miniaccel_drv` | 命令、脚本、验收统一使用 `miniaccel_drv` |
 | out-of-tree 模块 taint | dmesg 出现 signature/key missing 或 taints kernel | 未签名外部模块的正常提示 | 当前阶段接受；只把它和 oops/warning 区分开 |
 | BTF 跳过 | 构建输出 `Skipping BTF generation ...` | Guest headers 环境没有可用 `vmlinux` | 当前不影响 `.ko` 生成和加载 |
+| `kzalloc()` 后直接解引用 | 分配失败时可能触发空指针异常 | 没有检查返回值 | 判空后用 `dev_err()` 记录并返回 `-ENOMEM` |
+| 使用用户态 `free()` | 内核模块编译失败，提示 `free` 未声明 | 内核分配和释放 API 与用户态不同 | `kzalloc()` 对应使用 `kfree()` |
+| 单一失败路径仍使用 `goto` | 代码比实际资源生命周期更复杂 | 当前只有一次内存分配 | 分配失败时直接返回 `-ENOMEM`；以后有多级资源回滚再引入标签 |
 
-## 7. 本日产物
+## 8. 本日产物
 
 - `driver/char/miniaccel_drv.c`
 - `driver/char/Makefile`
@@ -340,12 +479,11 @@ no-recent-oops-warning-panic
 - `tests/probe/test_reload_100.sh`
 - `docs/week-01-probe.md`
 
-## 8. 下一步
+## 9. 下一步
 
 下一份 SOP 进入 Week 02：BAR0/MMIO。建议顺序：
 
-1. 给 `probe()` 添加设备私有结构 `struct miniaccel_dev`。
-2. 使用 `pci_set_drvdata()` / `pci_get_drvdata()` 管理生命周期。
-3. 调用 `pcim_enable_device()` 或等价 managed PCI enable 流程。
-4. request BAR0 并映射 MMIO。
-5. 只读 EDU 的安全寄存器，先验证 `ioread32()` 路径。
+1. 调用 `pcim_enable_device()` 或等价 managed PCI enable 流程。
+2. request BAR0 并映射 MMIO。
+3. 把 BAR0 映射地址保存到 `struct miniaccel_dev`。
+4. 只读 EDU 的安全寄存器，先验证 `ioread32()` 路径。
