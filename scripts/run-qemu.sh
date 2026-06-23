@@ -33,6 +33,8 @@ rm -f "$PID_FILE" "$SERIAL_LOG" "$MONITOR_SOCKET"
   -smp 2 \
   -m 1024 \
   -device edu \
+  -fsdev "local,id=miniaccel_fs,path=$ROOT_DIR,security_model=mapped-xattr" \
+  -device "virtio-9p-pci,fsdev=miniaccel_fs,mount_tag=miniaccel" \
   -drive "file=$ROOTFS,if=virtio,format=qcow2" \
   -drive "file=$SEED_IMAGE,if=virtio,format=raw,readonly=on" \
   -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22" \
@@ -44,4 +46,3 @@ rm -f "$PID_FILE" "$SERIAL_LOG" "$MONITOR_SOCKET"
   -daemonize
 
 echo "QEMU started with PID $(<"$PID_FILE"); SSH port is $SSH_PORT."
-
