@@ -2,11 +2,26 @@
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/slab.h>
+#include <linux/dma-mapping.h>
 
 #define DRV_NAME "miniaccel_drv"
 
+#define EDU_REG_IDENT       0x00    /* RO: 版本号 0x010000edu */
+#define EDU_REG_LIVENESS    0x04    /* RW: 读回 ~val */
+#define EDU_REG_FACTORIAL   0x08    /* RW: 阶乘 */
+#define EDU_REG_STATUS      0x20    /* RW: 状态 */
+#define EDU_REG_IRQ_STATUS  0x24    /* RO: 中断状态 */
+#define EDU_REG_RAISE_IRQ   0x60    /* WO: 触发中断 */
+#define EDU_REG_ACK_IRQ     0x64    /* WO: 确认中断 */
+#define EDU_REG_DMA_SRC     0x80
+#define EDU_REG_DMA_DST     0x88
+#define EDU_REG_DMA_CNT     0x90
+#define EDU_REG_DMA_CMD     0x98
+
 struct miniaccel_dev {
 	struct pci_dev *pdev;
+	void __iomem    *regs;
+	resource_size_t bar0_len;
 };
 
 /* ---------- 1. PCI ID 表 ---------- */
@@ -17,17 +32,41 @@ static const struct pci_device_id miniaccel_id_table[] = {
 };
 MODULE_DEVICE_TABLE(pci, miniaccel_id_table);
 
+static u32 miniaccel_read32(struct miniaccel_dev *mdev, u32 offset)
+{
+	if (offset > mdev->bar0_len - sizeof(u32))
+		return ~0U;
+
+	return ioread32(mdev->regs + offset);
+}
+
+static void miniaccel_write32(struct miniaccel_dev *mdev,
+			      u32 offset, u32 value)
+{
+	iowrite32(value, mdev->regs + offset);
+}
+
 /* ---------- 2. probe: 设备匹配成功后调用 ---------- */
 /* 返回 0 = 成功绑定; 负数 = 失败, core 会继续找别的驱动 */
 static int miniaccel_probe(struct pci_dev *pdev,
 			   const struct pci_device_id *id)
 {
+	int ret;
+
 	struct miniaccel_dev *mdev;
+
+	resource_size_t bar0_start;
+	resource_size_t bar0_end;
+	unsigned long bar0_flags;
+
+	u32 version;
+	u32 status;
 
 	mdev = kzalloc(sizeof(*mdev), GFP_KERNEL);
 	if (!mdev) {
 		dev_err(&pdev->dev, "failed to allocate private data\n");
-		return -ENOMEM;
+		ret = -ENOMEM;
+		return ret;
 	}
 
 	mdev->pdev = pdev;
@@ -36,7 +75,84 @@ static int miniaccel_probe(struct pci_dev *pdev,
 	dev_info(&pdev->dev, "probe called for %04x:%04x\n",
 		 pdev->vendor, pdev->device);
 
-	return 0;
+	ret = pci_enable_device(pdev);
+	if(ret != 0){
+		dev_err(&pdev->dev, "fail to enable device\n");
+		goto err_free;
+	}
+
+	ret = dma_set_mask_and_coherent(&pdev->dev,DMA_BIT_MASK(28));
+	if(ret != 0){
+		dev_err(&pdev->dev, "fail to set dma mask\n");
+		goto err_disable;
+	}
+
+	bar0_start = pci_resource_start(pdev,0);
+	mdev->bar0_len = pci_resource_len(pdev, 0);
+	bar0_flags = pci_resource_flags(pdev, 0);
+	bar0_end = pci_resource_end(pdev, 0);
+
+	dev_info(&pdev->dev,
+	 "BAR0: start=%pa end=%pa len=%pa flags=0x%lx\n",
+	 &bar0_start, &bar0_end, &mdev->bar0_len, bar0_flags);
+
+	if (!(bar0_flags & IORESOURCE_MEM)) {
+		dev_err(&pdev->dev, "BAR0 is not MMIO\n");
+		ret = -ENODEV;
+			goto err_disable;
+	}
+
+	if (!mdev->bar0_len) {
+		dev_err(&pdev->dev, "BAR0 has zero length\n");
+		ret = -ENODEV;
+		goto err_disable;
+	}
+
+	ret = pci_request_regions(pdev,"miniaccel");
+	if(ret != 0){
+		dev_err(&pdev->dev, "fail to request region\n");
+		goto err_disable;
+	}
+	pci_set_master(pdev);
+	mdev->regs = pci_iomap(pdev,0,0);
+	if(!mdev->regs){
+		dev_err(&pdev->dev, "failed to iomap BAR0\n");
+        ret = -ENOMEM;
+        goto err_request_region;
+	}
+
+	version = miniaccel_read32(mdev,EDU_REG_IDENT);
+    dev_info(&pdev->dev, "EDU identifier: 0x%08x\n", version);
+    if ((version & 0xfff) != 0xedu) {
+        dev_err(&pdev->dev,
+                "EDU identifier mismatch (got 0x%03x, expect 0xedu)\n",
+                version & 0xfff);
+        ret = -ENODEV;
+        goto err_ioremap;
+    }
+
+	status = miniaccel_read32(mdev, EDU_REG_STATUS);
+	if(status & 0x01){
+		dev_info(&pdev->dev,"status is computing\n");
+	}else{
+		dev_info(&pdev->dev,"status is idle\n");
+	}
+
+    dev_info(&pdev->dev, "probe ok: regs=%p version=0x%08x\n",
+             mdev->regs, version);
+    return 0;
+
+	err_ioremap:
+		if (mdev->regs)
+			pci_iounmap(pdev, mdev->regs);
+	err_request_region:
+		pci_release_regions(pdev);
+	err_disable:
+		pci_disable_device(pdev);
+	err_free:
+		pci_set_drvdata(pdev,NULL);
+		kfree(mdev);
+		return ret;
 }
 
 /* ---------- 3. remove: rmmod 或设备热拔时调用 ---------- */
@@ -45,8 +161,13 @@ static void miniaccel_remove(struct pci_dev *pdev)
 	struct miniaccel_dev *mdev = pci_get_drvdata(pdev);
 
 	pci_set_drvdata(pdev, NULL);
-	kfree(mdev);
 
+	if (mdev->regs)
+		pci_iounmap(pdev, mdev->regs);
+	pci_release_regions(pdev);
+	pci_disable_device(pdev);
+
+	kfree(mdev);
 	dev_info(&pdev->dev, "remove called for %04x:%04x\n",
 		 pdev->vendor, pdev->device);
 }
