@@ -1,4 +1,4 @@
-# 第 2 周 Day 1-5 SOP：BAR0 映射与 MMIO 读取
+# 第 2 周 Day 1-6 SOP：BAR0、MMIO 与资源失败回滚
 
 本文记录 MiniAccel 第 2 周当前已经实际完成的 PCI 资源和 MMIO 路径：
 观察 BAR0、启用设备、配置 DMA mask、申请 BAR、映射 MMIO，并读取 QEMU
@@ -15,12 +15,14 @@ EDU 的 identification 和 status 寄存器。
    `0x010000ed`，status 为 idle。
 5. `remove()` 能按逆序释放映射、BAR region、PCI device 和私有结构。
 6. 单次 bind/unbind 和 100 次 reload 测试通过。
+7. 32 位 MMIO helper 会拒绝未映射、未对齐和越界访问。
+8. 曾临时加入四个 probe 失败注入点完成回滚验证；验证后已从正式驱动移除。
+9. 专项 PCI resource 测试通过。
 
 当前未完全验收：
 
-- `make W=1` 仍报告 `miniaccel_write32()` 未使用。
-- 尚未人工注入每个 probe 失败点。
-- 尚未编写 Week 2 专项资源测试脚本。
+- 尚未接入统一的 `scripts/run-all-tests.sh`。
+- 尚未完成 Week 2 tag 和最终周报。
 
 ## 1. 当前上下文
 
@@ -41,9 +43,8 @@ EDU 的 identification 和 status 寄存器。
 
 本次是否完整跑通：
 
-- Day 1-Day 5 的正常路径已跑通。
-- Day 6 只验证了正常卸载和 reload，未完成人工失败注入。
-- Day 7 专项脚本和封版尚未执行。
+- Day 1-Day 6 已跑通。
+- Day 7 的专项资源脚本已完成，但统一测试入口、周报和 tag 尚未执行。
 
 ### 1.1 已完成前置条件
 
@@ -73,6 +74,8 @@ probe()
   -> pci_iomap(BAR0)
   -> miniaccel_read32(IDENT)
   -> miniaccel_read32(STATUS)
+  -> miniaccel_write32(LIVENESS)
+  -> miniaccel_read32(LIVENESS)
 
 remove()
   -> pci_iounmap()
@@ -289,48 +292,73 @@ if (!mdev->regs) {
 }
 ```
 
-32 位读 helper：
+32 位访问首先经过统一校验：
 
 ```c
-static u32 miniaccel_read32(struct miniaccel_dev *mdev, u32 offset)
+static int miniaccel_validate_mmio32(struct miniaccel_dev *mdev, u32 offset)
 {
-	if (offset > mdev->bar0_len - sizeof(u32))
-		return ~0U;
+	if (!mdev->regs)
+		return -ENODEV;
 
-	return ioread32(mdev->regs + offset);
+	if (!IS_ALIGNED(offset, sizeof(u32)))
+		return -EINVAL;
+
+	if (mdev->bar0_len < sizeof(u32) ||
+	    offset > mdev->bar0_len - sizeof(u32))
+		return -ERANGE;
+
+	return 0;
 }
 ```
 
-32 位写 helper：
+32 位读 helper 返回错误码，并通过输出参数返回寄存器值：
 
 ```c
-static void miniaccel_write32(struct miniaccel_dev *mdev,
-			      u32 offset, u32 value)
+static int miniaccel_read32(struct miniaccel_dev *mdev,
+			    u32 offset, u32 *value)
 {
-	iowrite32(value, mdev->regs + offset);
+	int ret;
+
+	ret = miniaccel_validate_mmio32(mdev, offset);
+	if (ret)
+		return ret;
+
+	*value = ioread32(mdev->regs + offset);
+	return 0;
 }
 ```
+
+写 helper 使用相同校验，再调用 `iowrite32()`。
 
 验收：
 
 - BAR0 映射结果非空。
 - MMIO 访问统一使用 `ioread32()` / `iowrite32()`。
 - 没有把 `__iomem` 指针当普通内存直接解引用。
-
-当前待修正：
-
-- 边界检查应先判断 `bar0_len < sizeof(u32)`，避免无符号减法下溢。
-- `miniaccel_write32()` 也应加入对齐和边界检查。
-- `miniaccel_write32()` 当前未被调用，`W=1` 会报告 unused warning。
-- 后续可将字段名 `regs` 统一为更明确的 `bar0`。
+- BAR 未映射时返回 `-ENODEV`。
+- offset 不是 4 字节对齐时返回 `-EINVAL`。
+- 访问越过 BAR0 末尾时返回 `-ERANGE`。
 
 ## 8. Day 5：读取 EDU 寄存器
 
 当前读取：
 
 ```c
-version = miniaccel_read32(mdev, EDU_REG_IDENT);
-status = miniaccel_read32(mdev, EDU_REG_STATUS);
+miniaccel_read32(mdev, EDU_REG_IDENT, &version);
+miniaccel_read32(mdev, EDU_REG_STATUS, &status);
+```
+
+驱动还会写入 EDU liveness register：
+
+```c
+miniaccel_write32(mdev, EDU_REG_LIVENESS, 0x12345678);
+miniaccel_read32(mdev, EDU_REG_LIVENESS, &liveness);
+```
+
+QEMU EDU 对该寄存器保存按位取反值，因此预期读回：
+
+```text
+~0x12345678 = 0xedcba987
 ```
 
 实际 dmesg：
@@ -355,11 +383,79 @@ if ((version & 0xfff) != 0xedu) {
 - identification 稳定读到 `0x010000ed`。
 - 低 12 位为 `0x0ed`，与 QEMU EDU 定义一致。
 - status 本次读到 idle。
+- liveness 稳定读到 `0xedcba987`。
 - ID 不匹配会进入完整 MMIO 资源回滚路径。
 
-## 9. 编译与运行验证
+## 9. Day 6：临时失败注入和回滚验证
 
-### 9.1 在共享目录编译
+为了验证正常 reload 无法覆盖的 probe 中途失败路径，本次曾临时在驱动中加入
+模块参数：
+
+```text
+fail_step=1  alloc 后失败，验证 kfree
+fail_step=2  enable 后失败，验证 disable + free
+fail_step=3  request regions 后失败，验证 release + disable + free
+fail_step=4  iomap 后失败，验证 iounmap + release + disable + free
+```
+
+注入判断会打印：
+
+```text
+injecting probe failure at step <N>
+```
+
+临时测试脚本（验证完成后已删除，以下命令只作为当时的执行记录）：
+
+```bash
+cd /mnt/miniaccel
+./tests/probe/test_probe_failures.sh
+```
+
+脚本对每个失败点检查：
+
+1. 模块已注册，但 PCI 设备没有绑定失败的 probe。
+2. `/proc/iomem` 没有残留 `miniaccel` BAR 占用。
+3. 卸载注入模块后，正常加载能够立即绑定设备。
+
+实际输出：
+
+```text
+fail-step-1-unwind-ok
+fail-step-2-unwind-ok
+fail-step-3-unwind-ok
+fail-step-4-unwind-ok
+```
+
+验收：
+
+- 四个资源层级的错误回滚均通过。
+- 失败后没有发现 BAR resource busy。
+- 每次失败后都能重新正常 probe。
+
+测试完成后的清理：
+
+- 从正式驱动中删除 `fail_step` 模块参数、失败枚举和注入判断。
+- 删除临时 `tests/probe/test_probe_failures.sh`。
+- 保留经过验证的错误标签和逆序释放路径。
+- 最终发布的驱动不会暴露测试专用模块参数，也不会混入测试分支。
+
+移除失败注入后的最终回归：
+
+```text
+pci-resources-ok start=0xfea00000 end=0xfeafffff len=0x100000 flags=0x40200
+bind-unbind-ok
+reload-100-ok
+no-recent-oops-warning-panic
+```
+
+结论：
+
+- 临时测试代码移除后，正式驱动仍能通过资源、绑定和 100 次 reload 测试。
+- 最终源码只保留正常资源申请、错误回滚和 remove 释放路径。
+
+## 10. 编译与运行验证
+
+### 10.1 在共享目录编译
 
 Guest 内执行：
 
@@ -373,7 +469,6 @@ make W=1
 
 ```text
 CC [M]  /mnt/miniaccel/driver/char/miniaccel_drv.o
-warning: 'miniaccel_write32' defined but not used
 MODPOST /mnt/miniaccel/driver/char/Module.symvers
 LD [M]  /mnt/miniaccel/driver/char/miniaccel_drv.ko
 Skipping BTF generation ... due to unavailability of vmlinux
@@ -382,11 +477,11 @@ Skipping BTF generation ... due to unavailability of vmlinux
 验收：
 
 - `.ko` 成功生成。
-- 仍有一个需要清理的 C warning，当前不能写成“W=1 无 warning”。
+- `W=1` 没有 C warning。
 - 9p 构建偶尔提示 clock skew，是宿主与 Guest 文件时间存在亚秒偏差；
   本次产物仍正常生成并成功加载。
 
-### 9.2 加载和卸载
+### 10.2 加载和卸载
 
 执行：
 
@@ -409,7 +504,30 @@ miniaccel_drv 0000:00:02.0: status is idle
 miniaccel_drv 0000:00:02.0: remove called for 1234:11e8
 ```
 
-### 9.3 生命周期回归
+### 10.3 专项资源测试
+
+执行：
+
+```bash
+cd /mnt/miniaccel
+./tests/probe/test_pci_resources.sh
+```
+
+脚本检查：
+
+- sysfs BAR0 start/end/length 有效。
+- 模块加载后设备绑定。
+- `/proc/iomem` 出现 `miniaccel` 占用。
+- dmesg 中存在 BAR0、IDENT 和 liveness 结果。
+- 卸载后 BAR 占用消失。
+
+实际输出：
+
+```text
+pci-resources-ok start=0xfea00000 end=0xfeafffff len=0x100000 flags=0x40200
+```
+
+### 10.4 生命周期回归
 
 执行：
 
@@ -432,7 +550,7 @@ no-recent-oops-warning-panic
 - 正常申请和释放路径可以重复执行。
 - 没有观察到 resource busy、Oops、BUG、WARNING、Call Trace 或 panic。
 
-## 10. 踩坑与修正
+## 11. 踩坑与修正
 
 | 问题 | 现象 | 原因 | 修正 |
 |---|---|---|---|
@@ -443,19 +561,20 @@ no-recent-oops-warning-panic
 | 用户态整数头文件 | 内核构建找不到 `stdint.h` / `cstddef` | 内核不使用用户态/C++ 标准头文件 | 使用内核类型 `u32` / `u64` |
 | 32 位边界检查减法下溢 | BAR 长度小于 4 时判断失效 | `resource_size_t` 是无符号类型 | 先检查 `bar0_len < sizeof(u32)` |
 | 非交互 SSH 裸 dmesg 失败 | `Operation not permitted` | 自动 root 只对带 TTY 的交互 shell 生效 | 交互登录直接使用；脚本中继续使用 `sudo dmesg` |
+| 只验证正常 remove | 错误标签可能跳错但 reload 仍通过 | 正常路径不会覆盖 probe 中途失败 | 临时增加 `fail_step=1..4` 验证，完成后从正式代码移除 |
+| write helper 未使用 | `W=1` 报 unused warning | 只有 IDENT/STATUS 读取 | 使用 liveness register 完成安全的 write/read 验证 |
 
-## 11. 当前产物
+## 12. 当前产物
 
 - `driver/char/miniaccel_drv.c`
 - `driver/char/Makefile`
 - `scripts/run-qemu.sh` 中的 9p 设备参数
 - Guest generic kernel 和自动 9p mount
 - `docs/week-02-mmio.md`
+- `tests/probe/test_pci_resources.sh`
 
-## 12. 下一步
+## 13. 下一步
 
-1. 清理 `miniaccel_write32()` 未使用 warning。
-2. 完成 read/write helper 的长度和对齐检查。
-3. 用显式失败注入逐条验证 Day 6 回滚路径。
-4. 新增 `tests/probe/test_pci_resources.sh`。
-5. 完成 Day 7 后再将 Week 2 标记为完整封版。
+1. 把 Week 2 测试接入统一的 `scripts/run-all-tests.sh`。
+2. 增加 Week 2 周报或封版记录。
+3. 完成最终回归后打 `week-02-mmio-resource` tag。
