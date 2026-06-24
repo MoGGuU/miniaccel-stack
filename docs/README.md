@@ -11,6 +11,11 @@
 - [第 1 周 Day 2：PCI 枚举与驱动匹配](week-01-pci.md)
 - [第 1 周 Day 3-5：KMD probe/remove 与绑定测试](week-01-probe.md)
 - [第 2 周 Day 1-5：BAR0 映射与 MMIO 读取](week-02-mmio.md)
+- [第 3 周 Day 1-7：字符设备、UAPI 与 ioctl](week-03-char-ioctl.md)
+
+## 接口文档
+
+- [MiniAccel UAPI](week-03-uapi.md)
 
 ## 源码阅读笔记
 
