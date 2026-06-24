@@ -7,6 +7,7 @@
 #   sudo rmmod  miniaccel_drv
 #   make clean
 
+ccflags-y += -I$(src)/../../include/uapi
 obj-m := miniaccel_drv.o
 
 all:

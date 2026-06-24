@@ -1,19 +1,33 @@
 // SPDX-License-Identifier: GPL-2.0
+#include <linux/cdev.h>
+#include <linux/device/class.h>
 #include <linux/dma-mapping.h>
+#include <linux/err.h>
+#include <linux/fs.h>
 #include <linux/init.h>
+#include <linux/idr.h>
+#include <linux/iopoll.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/pci.h>
 #include <linux/slab.h>
+#include <linux/uaccess.h>
+#include <miniaccel_uapi.h>
 
 #define DRV_NAME "miniaccel_drv"
 
-#define EDU_REG_IDENT		0x00	/* RO: 版本号 0x010000edu */
-#define EDU_REG_LIVENESS	0x04	/* RW: 读回 ~val */
-#define EDU_REG_FACTORIAL	0x08	/* RW: 阶乘 */
-#define EDU_REG_STATUS		0x20	/* RW: 状态 */
-#define EDU_REG_IRQ_STATUS	0x24	/* RO: 中断状态 */
-#define EDU_REG_RAISE_IRQ	0x60	/* WO: 触发中断 */
-#define EDU_REG_ACK_IRQ		0x64	/* WO: 确认中断 */
+#define MINIACCEL_MAX_DEVICES 256
+#define EDU_FACTORIAL_MAX_INPUT		12
+#define MINIACCEL_MAX_TIMEOUT_MS	10000
+#define MINIACCEL_POLL_INTERVAL_US	1000
+
+#define EDU_REG_IDENT		0x00 /* RO: 版本号 0x010000edu */
+#define EDU_REG_LIVENESS	0x04 /* RW: 读回 ~val */
+#define EDU_REG_FACTORIAL	0x08 /* RW: 阶乘 */
+#define EDU_REG_STATUS		0x20 /* RW: 状态 */
+#define EDU_REG_IRQ_STATUS	0x24 /* RO: 中断状态 */
+#define EDU_REG_RAISE_IRQ	0x60 /* WO: 触发中断 */
+#define EDU_REG_ACK_IRQ		0x64 /* WO: 确认中断 */
 #define EDU_REG_DMA_SRC		0x80
 #define EDU_REG_DMA_DST		0x88
 #define EDU_REG_DMA_CNT		0x90
@@ -24,19 +38,154 @@
 #define EDU_STATUS_COMPUTING	BIT(0)
 #define EDU_LIVENESS_TEST	0x12345678
 
+static dev_t miniaccel_base_devt;
+static struct class *miniaccel_class;
+static DEFINE_IDA(miniaccel_minor_ida);
+
 struct miniaccel_dev {
 	struct pci_dev *pdev;
 	void __iomem *regs;
 	resource_size_t bar0_len;
+
+	struct cdev cdev;
+	dev_t devt;
+	struct device *chardev;
+	int minor;
+
+	u32 device_id;
+	u32 version;
+
+	/* Serializes RUN_SYNC MMIO submissions for this device. */
+	struct mutex submit_lock;
 };
 
 /* ---------- 1. PCI ID 表 ---------- */
 /* 列出本驱动匹配的 vendor/device。pci_device_id 数组必须以全零项结尾。 */
 static const struct pci_device_id miniaccel_id_table[] = {
-	{ PCI_DEVICE(0x1234, 0x11e8) },	/* QEMU EDU */
-	{ 0, }				/* sentinel */
+	{ PCI_DEVICE(0x1234, 0x11e8) }, /* QEMU EDU */
+	{ 0, } /* sentinel */
 };
 MODULE_DEVICE_TABLE(pci, miniaccel_id_table);
+
+static int miniaccel_write32(struct miniaccel_dev *mdev, u32 offset, u32 value);
+static int miniaccel_read32(struct miniaccel_dev *mdev, u32 offset, u32 *value);
+
+static long miniaccel_ioctl_query(struct miniaccel_dev *mdev, void __user *argp)
+{
+	struct miniaccel_query query = {};
+
+	query.device_id = mdev->device_id;
+	query.version = mdev->version;
+	query.capabilities = MINIACCEL_CAP_RUN_SYNC;
+
+	if (copy_to_user(argp, &query, sizeof(query)))
+		return -EFAULT;
+
+	return 0;
+}
+
+static long miniaccel_ioctl_run_sync(struct miniaccel_dev *mdev,
+				     void __user *argp)
+{
+	struct miniaccel_run_sync run;
+	unsigned long timeout_us;
+	u32 status;
+	int ret;
+
+	if (copy_from_user(&run, argp, sizeof(run)))
+		return -EFAULT;
+
+	if (run.reserved)
+		return -EINVAL;
+
+	if (!run.timeout_ms || run.timeout_ms > MINIACCEL_MAX_TIMEOUT_MS)
+		return -EINVAL;
+
+	if (run.input > EDU_FACTORIAL_MAX_INPUT)
+		return -EINVAL;
+
+	timeout_us = (unsigned long)run.timeout_ms * 1000UL;
+
+	mutex_lock(&mdev->submit_lock);
+
+	ret = miniaccel_read32(mdev, EDU_REG_STATUS, &status);
+	if (ret)
+		goto out_unlock;
+
+	if (status & EDU_STATUS_COMPUTING) {
+		ret = -EBUSY;
+		goto out_unlock;
+	}
+
+	ret = miniaccel_write32(mdev, EDU_REG_FACTORIAL, run.input);
+	if (ret)
+		goto out_unlock;
+
+	ret = read_poll_timeout(ioread32, status,
+				!(status & EDU_STATUS_COMPUTING),
+				MINIACCEL_POLL_INTERVAL_US,
+				timeout_us,
+				false,
+				mdev->regs + EDU_REG_STATUS);
+	if (ret)
+		goto out_unlock;
+
+	ret = miniaccel_read32(mdev, EDU_REG_FACTORIAL, &run.output);
+
+out_unlock:
+	mutex_unlock(&mdev->submit_lock);
+
+	if (ret)
+		return ret;
+
+	if (copy_to_user(argp, &run, sizeof(run)))
+		return -EFAULT;
+
+	return 0;
+}
+
+static int miniaccel_open(struct inode *inode, struct file *file)
+{
+	struct miniaccel_dev *mdev;
+
+	mdev = container_of(inode->i_cdev, struct miniaccel_dev, cdev);
+	file->private_data = mdev;
+
+	return 0;
+}
+
+static int miniaccel_release(struct inode *inode, struct file *file)
+{
+	file->private_data = NULL;
+
+	return 0;
+}
+
+static long miniaccel_ioctl(struct file *file, unsigned int cmd,
+			    unsigned long arg)
+{
+	struct miniaccel_dev *mdev = file->private_data;
+	void __user *argp = (void __user *)arg;
+
+	if (!mdev)
+		return -ENODEV;
+
+	switch (cmd) {
+	case MINIACCEL_IOCTL_QUERY:
+		return miniaccel_ioctl_query(mdev, argp);
+	case MINIACCEL_IOCTL_RUN_SYNC:
+		return miniaccel_ioctl_run_sync(mdev, argp);
+	default:
+		return -ENOTTY;
+	}
+}
+
+static const struct file_operations miniaccel_ops = {
+	.owner		= THIS_MODULE,
+	.open		= miniaccel_open,
+	.release	= miniaccel_release,
+	.unlocked_ioctl	= miniaccel_ioctl,
+};
 
 static int miniaccel_validate_mmio32(struct miniaccel_dev *mdev, u32 offset)
 {
@@ -65,8 +214,7 @@ static int miniaccel_read32(struct miniaccel_dev *mdev, u32 offset, u32 *value)
 	return 0;
 }
 
-static int miniaccel_write32(struct miniaccel_dev *mdev,
-			     u32 offset, u32 value)
+static int miniaccel_write32(struct miniaccel_dev *mdev, u32 offset, u32 value)
 {
 	int ret;
 
@@ -80,8 +228,7 @@ static int miniaccel_write32(struct miniaccel_dev *mdev,
 
 /* ---------- 2. probe: 设备匹配成功后调用 ---------- */
 /* 返回 0 = 成功绑定; 负数 = 失败, core 会继续找别的驱动 */
-static int miniaccel_probe(struct pci_dev *pdev,
-			   const struct pci_device_id *id)
+static int miniaccel_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	int ret;
 	struct miniaccel_dev *mdev;
@@ -97,9 +244,9 @@ static int miniaccel_probe(struct pci_dev *pdev,
 		return -ENOMEM;
 
 	mdev->pdev = pdev;
-
-	dev_info(&pdev->dev, "probe called for %04x:%04x\n",
-		 pdev->vendor, pdev->device);
+	mdev->device_id = pdev->device;
+	dev_info(&pdev->dev, "probe called for %04x:%04x\n", pdev->vendor,
+		 pdev->device);
 
 	ret = pci_enable_device(pdev);
 	if (ret) {
@@ -118,8 +265,7 @@ static int miniaccel_probe(struct pci_dev *pdev,
 	bar0_flags = pci_resource_flags(pdev, 0);
 	bar0_end = pci_resource_end(pdev, 0);
 
-	dev_info(&pdev->dev,
-		 "BAR0: start=%pa end=%pa len=%pa flags=0x%lx\n",
+	dev_info(&pdev->dev, "BAR0: start=%pa end=%pa len=%pa flags=0x%lx\n",
 		 &bar0_start, &bar0_end, &mdev->bar0_len, bar0_flags);
 
 	if (!(bar0_flags & IORESOURCE_MEM)) {
@@ -161,6 +307,8 @@ static int miniaccel_probe(struct pci_dev *pdev,
 		goto err_iounmap;
 	}
 
+	mdev->version = version;
+
 	ret = miniaccel_read32(mdev, EDU_REG_STATUS, &status);
 	if (ret)
 		goto err_iounmap;
@@ -184,12 +332,46 @@ static int miniaccel_probe(struct pci_dev *pdev,
 		goto err_iounmap;
 	}
 
+	mutex_init(&mdev->submit_lock);
+
+	ret = ida_alloc_range(&miniaccel_minor_ida, 0,
+			      MINIACCEL_MAX_DEVICES - 1, GFP_KERNEL);
+	if (ret < 0) {
+		dev_err(&pdev->dev, "failed to allocate minor: %d\n", ret);
+		goto err_iounmap;
+	}
+
+	mdev->minor = ret;
+	mdev->devt = MKDEV(MAJOR(miniaccel_base_devt),
+			   MINOR(miniaccel_base_devt) + mdev->minor);
+	cdev_init(&mdev->cdev, &miniaccel_ops);
+	mdev->cdev.owner = THIS_MODULE;
+
+	ret = cdev_add(&mdev->cdev, mdev->devt, 1);
+	if (ret) {
+		dev_err(&pdev->dev, "failed to add cdev: %d\n", ret);
+		goto err_free_minor;
+	}
+	mdev->chardev = device_create(miniaccel_class, &pdev->dev, mdev->devt,
+				      mdev, "miniaccel%d", mdev->minor);
+
+	if (IS_ERR(mdev->chardev)) {
+		ret = PTR_ERR(mdev->chardev);
+		dev_err(&pdev->dev, "failed to create device: %d\n", ret);
+		goto err_cdev_del;
+	}
+
 	pci_set_drvdata(pdev, mdev);
 	dev_info(&pdev->dev,
 		 "probe ok: regs=%p version=0x%08x liveness=0x%08x\n",
 		 mdev->regs, version, liveness);
+
 	return 0;
 
+err_cdev_del:
+	cdev_del(&mdev->cdev);
+err_free_minor:
+	ida_free(&miniaccel_minor_ida, mdev->minor);
 err_iounmap:
 	pci_iounmap(pdev, mdev->regs);
 err_release_regions:
@@ -208,23 +390,27 @@ static void miniaccel_remove(struct pci_dev *pdev)
 
 	pci_set_drvdata(pdev, NULL);
 
+	device_destroy(miniaccel_class, mdev->devt);
+	cdev_del(&mdev->cdev);
+	ida_free(&miniaccel_minor_ida, mdev->minor);
+
 	if (mdev->regs)
 		pci_iounmap(pdev, mdev->regs);
+
 	pci_release_regions(pdev);
 	pci_disable_device(pdev);
-
 	kfree(mdev);
-	dev_info(&pdev->dev, "remove called for %04x:%04x\n",
-		 pdev->vendor, pdev->device);
+
+	dev_info(&pdev->dev, "device removed\n");
 }
 
 /* ---------- 4. pci_driver 结构 ---------- */
 /* 把 probe/remove/id_table 装到一起, 给 pci_register_driver 用. */
 static struct pci_driver miniaccel_driver = {
-	.name		= DRV_NAME,
-	.id_table	= miniaccel_id_table,
-	.probe		= miniaccel_probe,
-	.remove		= miniaccel_remove,
+	.name = DRV_NAME,
+	.id_table = miniaccel_id_table,
+	.probe = miniaccel_probe,
+	.remove = miniaccel_remove,
 };
 
 /* ---------- 5. 模块入口 / 出口 ---------- */
@@ -234,17 +420,46 @@ static int __init miniaccel_drv_init(void)
 
 	pr_info("%s: module_init\n", DRV_NAME);
 
-	ret = pci_register_driver(&miniaccel_driver);
-	if (ret)
-		pr_err("%s: failed to register PCI driver: %d\n",
+	ret = alloc_chrdev_region(&miniaccel_base_devt, 0,
+				  MINIACCEL_MAX_DEVICES, "miniaccel");
+	if (ret) {
+		pr_err("%s: failed to allocate character device numbers: %d\n",
 		       DRV_NAME, ret);
+		goto err_alloc;
+	}
 
+	miniaccel_class = class_create(THIS_MODULE, "miniaccel");
+	if (IS_ERR(miniaccel_class)) {
+		ret = PTR_ERR(miniaccel_class);
+		pr_err("%s: failed to create device class: %d\n", DRV_NAME,
+		       ret);
+		goto err_class;
+	}
+	ret = pci_register_driver(&miniaccel_driver);
+	if (ret) {
+		pr_err("%s: failed to register PCI driver: %d\n", DRV_NAME,
+		       ret);
+		goto err_pci_register;
+	}
+
+	return ret;
+
+err_pci_register:
+	class_destroy(miniaccel_class);
+err_class:
+	unregister_chrdev_region(miniaccel_base_devt, MINIACCEL_MAX_DEVICES);
+err_alloc:
 	return ret;
 }
 
 static void __exit miniaccel_drv_exit(void)
 {
 	pci_unregister_driver(&miniaccel_driver);
+
+	class_destroy(miniaccel_class);
+	unregister_chrdev_region(miniaccel_base_devt, MINIACCEL_MAX_DEVICES);
+	ida_destroy(&miniaccel_minor_ida);
+
 	pr_info("%s: module_exit\n", DRV_NAME);
 }
 
