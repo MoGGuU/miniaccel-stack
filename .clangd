@@ -1,0 +1,19 @@
+CompileFlags:
+  Remove:
+    - -Werror=*
+    - -fconserve-stack
+    - -fno-allow-store-data-races
+    - -mrecord-mcount
+    - -mindirect-branch=*
+    - -mindirect-branch-register
+    - -mindirect-branch-cs-prefix
+    - -mfunction-return=*
+    - -mharden-sls=*
+    - -mpreferred-stack-boundary=*
+    - -mskip-rax-setup
+    - -mno-80387
+    - -mno-fp-ret-in-387
+    - -fcf-protection=*
+    - -ftrivial-auto-var-init=*
+    - -Wno-alloc-size-larger-than
+    - -Wno-dangling-pointer
