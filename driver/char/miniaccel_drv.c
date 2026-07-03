@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/cdev.h>
+#include <linux/completion.h>
 #include <linux/device/class.h>
 #include <linux/dma-mapping.h>
 #include <linux/err.h>
@@ -7,11 +8,16 @@
 #include <linux/init.h>
 #include <linux/idr.h>
 #include <linux/iopoll.h>
+#include <linux/interrupt.h>
+#include <linux/jiffies.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
+#include <linux/poll.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/uaccess.h>
+#include <linux/wait.h>
 #include <miniaccel_uapi.h>
 
 #define DRV_NAME "miniaccel_drv"
@@ -38,9 +44,16 @@
 #define EDU_STATUS_COMPUTING	BIT(0)
 #define EDU_LIVENESS_TEST	0x12345678
 
+#define EDU_IRQ_FACTORIAL	BIT(0)
+#define EDU_STATUS_IRQFACT	BIT(7)
+
 static dev_t miniaccel_base_devt;
 static struct class *miniaccel_class;
 static DEFINE_IDA(miniaccel_minor_ida);
+static bool force_timeout;
+
+module_param(force_timeout, bool, 0644);
+MODULE_PARM_DESC(force_timeout, "Force RUN_SYNC timeout for IRQ wait tests");
 
 struct miniaccel_dev {
 	struct pci_dev *pdev;
@@ -57,6 +70,24 @@ struct miniaccel_dev {
 
 	/* Serializes RUN_SYNC MMIO submissions for this device. */
 	struct mutex submit_lock;
+
+	int irq;
+	struct completion cmd_done;
+	wait_queue_head_t event_wq;
+	/* Protects IRQ state shared with process context. */
+	spinlock_t irq_lock;
+
+	u32 irq_status;
+	u64 irq_count;
+	u64 submit_seqno;
+	u64 done_seqno;
+	bool in_flight;
+
+};
+
+struct miniaccel_file {
+	struct miniaccel_dev *mdev;
+	u64 seen_seqno;
 };
 
 /* ---------- 1. PCI ID 表 ---------- */
@@ -88,7 +119,8 @@ static long miniaccel_ioctl_run_sync(struct miniaccel_dev *mdev,
 				     void __user *argp)
 {
 	struct miniaccel_run_sync run;
-	unsigned long timeout_us;
+	unsigned long flags;
+	unsigned long timeout_jiffies;
 	u32 status;
 	int ret;
 
@@ -104,71 +136,110 @@ static long miniaccel_ioctl_run_sync(struct miniaccel_dev *mdev,
 	if (run.input > EDU_FACTORIAL_MAX_INPUT)
 		return -EINVAL;
 
-	timeout_us = (unsigned long)run.timeout_ms * 1000UL;
+	timeout_jiffies = msecs_to_jiffies(run.timeout_ms);
 
 	mutex_lock(&mdev->submit_lock);
 
 	ret = miniaccel_read32(mdev, EDU_REG_STATUS, &status);
 	if (ret)
-		goto out_unlock;
+		goto unlock;
 
 	if (status & EDU_STATUS_COMPUTING) {
 		ret = -EBUSY;
-		goto out_unlock;
+		goto unlock;
 	}
+
+	spin_lock_irqsave(&mdev->irq_lock, flags);
+	if (mdev->in_flight) {
+		spin_unlock_irqrestore(&mdev->irq_lock, flags);
+		ret = -EBUSY;
+		goto unlock;
+	}
+	reinit_completion(&mdev->cmd_done);
+	mdev->submit_seqno++;
+	mdev->in_flight = true;
+	spin_unlock_irqrestore(&mdev->irq_lock, flags);
+
+	if (force_timeout) {
+		ret = -ETIMEDOUT;
+		goto clear_in_flight;
+	}
+
+	ret = miniaccel_write32(mdev, EDU_REG_STATUS, EDU_STATUS_IRQFACT);
+	if (ret)
+		goto clear_in_flight;
 
 	ret = miniaccel_write32(mdev, EDU_REG_FACTORIAL, run.input);
 	if (ret)
-		goto out_unlock;
+		goto clear_in_flight;
 
-	ret = read_poll_timeout(ioread32, status,
-				!(status & EDU_STATUS_COMPUTING),
-				MINIACCEL_POLL_INTERVAL_US,
-				timeout_us,
-				false,
-				mdev->regs + EDU_REG_STATUS);
-	if (ret)
-		goto out_unlock;
+	if (!wait_for_completion_timeout(&mdev->cmd_done, timeout_jiffies)) {
+		ret = -ETIMEDOUT;
+		goto clear_in_flight;
+	}
 
 	ret = miniaccel_read32(mdev, EDU_REG_FACTORIAL, &run.output);
-
-out_unlock:
-	mutex_unlock(&mdev->submit_lock);
-
 	if (ret)
-		return ret;
+		goto unlock;
+
+	mutex_unlock(&mdev->submit_lock);
 
 	if (copy_to_user(argp, &run, sizeof(run)))
 		return -EFAULT;
 
 	return 0;
+
+clear_in_flight:
+	spin_lock_irqsave(&mdev->irq_lock, flags);
+	if (mdev->in_flight)
+		mdev->in_flight = false;
+	spin_unlock_irqrestore(&mdev->irq_lock, flags);
+
+unlock:
+	mutex_unlock(&mdev->submit_lock);
+	return ret;
 }
 
 static int miniaccel_open(struct inode *inode, struct file *file)
 {
+	struct miniaccel_file *mfile;
 	struct miniaccel_dev *mdev;
+	unsigned long flags;
 
 	mdev = container_of(inode->i_cdev, struct miniaccel_dev, cdev);
-	file->private_data = mdev;
+
+	mfile = kzalloc(sizeof(*mfile), GFP_KERNEL);
+	if (!mfile)
+		return -ENOMEM;
+	mfile->mdev = mdev;
+
+	spin_lock_irqsave(&mdev->irq_lock, flags);
+	mfile->seen_seqno = mdev->done_seqno;
+	spin_unlock_irqrestore(&mdev->irq_lock, flags);
+
+	file->private_data = mfile;
 
 	return 0;
 }
 
 static int miniaccel_release(struct inode *inode, struct file *file)
 {
+	kfree(file->private_data);
 	file->private_data = NULL;
-
 	return 0;
 }
 
 static long miniaccel_ioctl(struct file *file, unsigned int cmd,
 			    unsigned long arg)
 {
-	struct miniaccel_dev *mdev = file->private_data;
+	struct miniaccel_file *mfile = file->private_data;
+	struct miniaccel_dev *mdev;
 	void __user *argp = (void __user *)arg;
 
-	if (!mdev)
+	if (!mfile || !mfile->mdev)
 		return -ENODEV;
+
+	mdev = mfile->mdev;
 
 	switch (cmd) {
 	case MINIACCEL_IOCTL_QUERY:
@@ -180,11 +251,36 @@ static long miniaccel_ioctl(struct file *file, unsigned int cmd,
 	}
 }
 
+static __poll_t miniaccel_poll(struct file *file, poll_table *wait)
+{
+	struct miniaccel_file *mfile = file->private_data;
+	struct miniaccel_dev *mdev;
+	unsigned long flags;
+	__poll_t mask = 0;
+
+	if (!mfile || !mfile->mdev)
+		return EPOLLERR;
+
+	mdev = mfile->mdev;
+
+	poll_wait(file, &mdev->event_wq, wait);
+
+	spin_lock_irqsave(&mdev->irq_lock, flags);
+	if (mdev->done_seqno > mfile->seen_seqno) {
+		mfile->seen_seqno = mdev->done_seqno;
+		mask = EPOLLIN | EPOLLRDNORM;
+	}
+	spin_unlock_irqrestore(&mdev->irq_lock, flags);
+
+	return mask;
+}
+
 static const struct file_operations miniaccel_ops = {
 	.owner		= THIS_MODULE,
 	.open		= miniaccel_open,
 	.release	= miniaccel_release,
 	.unlocked_ioctl	= miniaccel_ioctl,
+	.poll		= miniaccel_poll,
 };
 
 static int miniaccel_validate_mmio32(struct miniaccel_dev *mdev, u32 offset)
@@ -226,11 +322,46 @@ static int miniaccel_write32(struct miniaccel_dev *mdev, u32 offset, u32 value)
 	return 0;
 }
 
+static irqreturn_t miniaccel_irq_handler(int irq, void *dev_id)
+{
+	struct miniaccel_dev *mdev = dev_id;
+	bool cmd_done = false;
+	unsigned long flags;
+	u32 status;
+	int ret;
+
+	ret = miniaccel_read32(mdev, EDU_REG_IRQ_STATUS, &status);
+	if (ret || !status)
+		return IRQ_NONE;
+
+	ret = miniaccel_write32(mdev, EDU_REG_ACK_IRQ, status);
+	if (ret)
+		return IRQ_HANDLED;
+
+	spin_lock_irqsave(&mdev->irq_lock, flags);
+	mdev->irq_status = status;
+	mdev->irq_count++;
+	if ((status & EDU_IRQ_FACTORIAL) && mdev->in_flight) {
+		mdev->done_seqno = mdev->submit_seqno;
+		mdev->in_flight = false;
+		cmd_done = true;
+	}
+	spin_unlock_irqrestore(&mdev->irq_lock, flags);
+
+	if (cmd_done) {
+		complete(&mdev->cmd_done);
+		wake_up_interruptible(&mdev->event_wq);
+	}
+
+	return IRQ_HANDLED;
+}
+
 /* ---------- 2. probe: 设备匹配成功后调用 ---------- */
 /* 返回 0 = 成功绑定; 负数 = 失败, core 会继续找别的驱动 */
 static int miniaccel_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	int ret;
+	int nr_vecs;
 	struct miniaccel_dev *mdev;
 	resource_size_t bar0_start;
 	resource_size_t bar0_end;
@@ -332,13 +463,37 @@ static int miniaccel_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto err_iounmap;
 	}
 
+	mdev->irq = -1;
+	init_completion(&mdev->cmd_done);
+	init_waitqueue_head(&mdev->event_wq);
+	spin_lock_init(&mdev->irq_lock);
 	mutex_init(&mdev->submit_lock);
+
+	nr_vecs = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSIX | PCI_IRQ_MSI);
+	if (nr_vecs < 0) {
+		ret = nr_vecs;
+		dev_err(&pdev->dev, "failed to allocate IRQ vectors: %d\n", ret);
+		goto err_iounmap;
+	}
+	mdev->irq = pci_irq_vector(pdev, 0);
+	if (mdev->irq < 0) {
+		ret = mdev->irq;
+		dev_err(&pdev->dev, "failed to get IRQ vector 0: %d\n", ret);
+		goto err_free_irq_vectors;
+	}
+	ret = request_irq(mdev->irq, miniaccel_irq_handler, 0, DRV_NAME, mdev);
+	if (ret) {
+		dev_err(&pdev->dev, "failed to request IRQ %d: %d\n", mdev->irq, ret);
+		goto err_free_irq_vectors;
+	}
+	dev_info(&pdev->dev, "allocated %d IRQ vector(s), linux irq=%d\n",
+		 nr_vecs, mdev->irq);
 
 	ret = ida_alloc_range(&miniaccel_minor_ida, 0,
 			      MINIACCEL_MAX_DEVICES - 1, GFP_KERNEL);
 	if (ret < 0) {
 		dev_err(&pdev->dev, "failed to allocate minor: %d\n", ret);
-		goto err_iounmap;
+		goto err_free_irq;
 	}
 
 	mdev->minor = ret;
@@ -372,6 +527,10 @@ err_cdev_del:
 	cdev_del(&mdev->cdev);
 err_free_minor:
 	ida_free(&miniaccel_minor_ida, mdev->minor);
+err_free_irq:
+	free_irq(mdev->irq, mdev);
+err_free_irq_vectors:
+	pci_free_irq_vectors(pdev);
 err_iounmap:
 	pci_iounmap(pdev, mdev->regs);
 err_release_regions:
@@ -393,7 +552,8 @@ static void miniaccel_remove(struct pci_dev *pdev)
 	device_destroy(miniaccel_class, mdev->devt);
 	cdev_del(&mdev->cdev);
 	ida_free(&miniaccel_minor_ida, mdev->minor);
-
+	free_irq(mdev->irq, mdev);
+	pci_free_irq_vectors(pdev);
 	if (mdev->regs)
 		pci_iounmap(pdev, mdev->regs);
 
