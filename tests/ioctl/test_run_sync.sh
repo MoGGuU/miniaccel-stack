@@ -4,9 +4,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 DRIVER_DIR="${DRIVER_DIR:-$ROOT_DIR/driver/char}"
-MODULE_NAME="${MODULE_NAME:-miniaccel_drv}"
+if [[ -z "${MODULE_NAME:-}" ]]; then
+	MODULE_NAME="$("$ROOT_DIR/scripts/detect-driver-module.sh")"
+fi
 KO_PATH="${KO_PATH:-$DRIVER_DIR/$MODULE_NAME.ko}"
 RUN_BIN="${RUN_BIN:-/tmp/miniaccel-run-sync-test}"
+INFO_BIN="${INFO_BIN:-/tmp/miniaccel-info-run-sync-test}"
 
 if ((EUID == 0)); then
 	SUDO=()
@@ -22,7 +25,7 @@ module_loaded()
 cleanup()
 {
 	unload_module
-	rm -f "$RUN_BIN"
+	rm -f "$RUN_BIN" "$INFO_BIN"
 }
 
 unload_module()
@@ -41,9 +44,25 @@ trap cleanup EXIT
 
 gcc -Wall -Wextra -Werror -I"$ROOT_DIR/include/uapi" \
 	"$ROOT_DIR/tools/miniaccel-run-sync.c" -o "$RUN_BIN"
+gcc -Wall -Wextra -Werror -I"$ROOT_DIR/include/uapi" \
+	"$ROOT_DIR/tools/miniaccel-info.c" -o "$INFO_BIN"
 
 unload_module
 "${SUDO[@]}" insmod "$KO_PATH"
+
+info_output="$("${SUDO[@]}" "$INFO_BIN")"
+echo "$info_output"
+
+if grep -q "device_id=0xacc1" <<<"$info_output"; then
+	output="$("${SUDO[@]}" "$RUN_BIN" --opcode nop --repeat 3 --timeout-ms 1000)"
+	echo "$output"
+	grep -q "opcode=nop seqno=1" <<<"$output"
+	grep -q "opcode=nop seqno=2" <<<"$output"
+	grep -q "opcode=nop seqno=3" <<<"$output"
+	grep -q "run-sync-nop-ok repeat=3" <<<"$output"
+	echo "run-sync-ioctl-ok"
+	exit 0
+fi
 
 run_and_check()
 {

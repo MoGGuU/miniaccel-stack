@@ -4,7 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 DRIVER_DIR="${DRIVER_DIR:-$ROOT_DIR/driver/char}"
-MODULE_NAME="${MODULE_NAME:-miniaccel_drv}"
+if [[ -z "${MODULE_NAME:-}" ]]; then
+	MODULE_NAME="$("$ROOT_DIR/scripts/detect-driver-module.sh")"
+fi
 BDF="${BDF:-00:02.0}"
 SYSFS_BDF="${SYSFS_BDF:-0000:$BDF}"
 KO_PATH="${KO_PATH:-$DRIVER_DIR/$MODULE_NAME.ko}"
@@ -62,8 +64,13 @@ lspci -nnk -s "$BDF" | grep -q "Kernel driver in use: $MODULE_NAME"
 region_claimed
 
 "${SUDO[@]}" dmesg | grep -q "BAR0: start="
-"${SUDO[@]}" dmesg | grep -q "EDU identifier: 0x010000ed"
-"${SUDO[@]}" dmesg | grep -q "liveness=0xedcba987"
+if lspci -nn -s "$BDF" | grep -qi "1afe:acc1"; then
+	"${SUDO[@]}" dmesg | grep -q "MiniAccel identity: magic=0x4d414343"
+	"${SUDO[@]}" dmesg | grep -q "probe ok: MiniAccel"
+else
+	"${SUDO[@]}" dmesg | grep -q "EDU identifier: 0x010000ed"
+	"${SUDO[@]}" dmesg | grep -q "liveness=0xedcba987"
+fi
 
 "${SUDO[@]}" rmmod "$MODULE_NAME"
 

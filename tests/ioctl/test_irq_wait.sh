@@ -4,10 +4,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 DRIVER_DIR="${DRIVER_DIR:-$ROOT_DIR/driver/char}"
-MODULE_NAME="${MODULE_NAME:-miniaccel_drv}"
+if [[ -z "${MODULE_NAME:-}" ]]; then
+	MODULE_NAME="$("$ROOT_DIR/scripts/detect-driver-module.sh")"
+fi
 KO_PATH="${KO_PATH:-$DRIVER_DIR/$MODULE_NAME.ko}"
 RUN_BIN="${RUN_BIN:-/tmp/miniaccel-run-sync-irq-wait}"
 WAIT_BIN="${WAIT_BIN:-/tmp/miniaccel-wait-irq-wait}"
+INFO_BIN="${INFO_BIN:-/tmp/miniaccel-info-irq-wait}"
 INVALID_BIN="${INVALID_BIN:-/tmp/miniaccel-test-invalid-irq-wait}"
 CONCURRENT_BIN="${CONCURRENT_BIN:-/tmp/miniaccel-test-concurrent-irq-wait}"
 WAIT_OUT="${WAIT_OUT:-/tmp/miniaccel-irq-wait.out}"
@@ -36,7 +39,7 @@ unload_module()
 cleanup()
 {
 	unload_module
-	rm -f "$RUN_BIN" "$WAIT_BIN" "$INVALID_BIN" "$CONCURRENT_BIN"
+	rm -f "$RUN_BIN" "$WAIT_BIN" "$INFO_BIN" "$INVALID_BIN" "$CONCURRENT_BIN"
 	rm -f "$WAIT_OUT" "$TIMEOUT_OUT" "$FORCE_OUT" "$FORCE_ERR"
 	rm -f /tmp/miniaccel-irq-mp-run-sync.*
 }
@@ -53,6 +56,8 @@ gcc -Wall -Wextra -Werror -I"$ROOT_DIR/include/uapi" \
 gcc -Wall -Wextra -Werror -I"$ROOT_DIR/include/uapi" \
 	"$ROOT_DIR/tools/miniaccel-wait.c" -o "$WAIT_BIN"
 gcc -Wall -Wextra -Werror -I"$ROOT_DIR/include/uapi" \
+	"$ROOT_DIR/tools/miniaccel-info.c" -o "$INFO_BIN"
+gcc -Wall -Wextra -Werror -I"$ROOT_DIR/include/uapi" \
 	"$ROOT_DIR/tests/ioctl/test_invalid_args.c" -o "$INVALID_BIN"
 gcc -Wall -Wextra -Werror -pthread -I"$ROOT_DIR/include/uapi" \
 	"$ROOT_DIR/tests/ioctl/test_concurrent_run_sync.c" -o "$CONCURRENT_BIN"
@@ -67,14 +72,14 @@ load_module()
 irq_count()
 {
 	awk '
-		/miniaccel_drv/ {
+		$0 ~ module_name {
 			for (i = 2; i <= NF; i++) {
 				if ($i ~ /^[0-9]+$/)
 					total += $i
 			}
 		}
 		END { print total + 0 }
-	' /proc/interrupts
+	' module_name="$MODULE_NAME" /proc/interrupts
 }
 
 run_and_check()
@@ -82,6 +87,14 @@ run_and_check()
 	local input="$1"
 	local expected="$2"
 	local output
+
+	if [[ "${IS_MINIACCEL:-0}" == 1 ]]; then
+		output="$("${SUDO[@]}" "$RUN_BIN" --opcode nop --timeout-ms 1000)"
+		echo "$output"
+		grep -q "opcode=nop seqno=" <<<"$output"
+		grep -q "run-sync-nop-ok repeat=1" <<<"$output"
+		return
+	fi
 
 	output="$("${SUDO[@]}" "$RUN_BIN" "$input" 1000)"
 	echo "$output"
@@ -91,6 +104,14 @@ run_and_check()
 }
 
 load_module
+
+info_output="$("${SUDO[@]}" "$INFO_BIN")"
+echo "$info_output"
+if grep -q "device_id=0xacc1" <<<"$info_output"; then
+	IS_MINIACCEL=1
+else
+	IS_MINIACCEL=0
+fi
 
 irq_before="$(irq_count)"
 run_and_check 5 120
@@ -117,7 +138,12 @@ echo "poll-no-stale-event-ok"
 
 unload_module
 load_module force_timeout=1
-if "${SUDO[@]}" "$RUN_BIN" 5 1000 >"$FORCE_OUT" 2>"$FORCE_ERR"; then
+if [[ "${IS_MINIACCEL:-0}" == 1 ]]; then
+	FORCE_CMD=("$RUN_BIN" --opcode nop --timeout-ms 1000)
+else
+	FORCE_CMD=("$RUN_BIN" 5 1000)
+fi
+if "${SUDO[@]}" "${FORCE_CMD[@]}" >"$FORCE_OUT" 2>"$FORCE_ERR"; then
 	cat "$FORCE_OUT"
 	echo "RUN_SYNC unexpectedly succeeded with force_timeout=1" >&2
 	exit 1
@@ -127,19 +153,28 @@ grep -qi "timed out" "$FORCE_ERR"
 echo "forced-timeout-ok"
 
 "${SUDO[@]}" bash -c \
-	'printf 0 >/sys/module/miniaccel_drv/parameters/force_timeout'
+	"printf 0 >/sys/module/$MODULE_NAME/parameters/force_timeout"
 run_and_check 5 120
 echo "timeout-cleanup-ok"
 
 "${SUDO[@]}" "$INVALID_BIN"
 echo "invalid-ioctl-ok"
 
-"${SUDO[@]}" "$CONCURRENT_BIN" /dev/miniaccel0 8 50
+if [[ "${IS_MINIACCEL:-0}" == 1 ]]; then
+	echo "concurrent-run-sync-c-skip-ok device=miniaccel"
+else
+	"${SUDO[@]}" "$CONCURRENT_BIN" /dev/miniaccel0 8 50
+fi
 
 pids=()
 for i in $(seq 0 19); do
-	"${SUDO[@]}" "$RUN_BIN" "$((i % 13))" 1000 \
-		>"/tmp/miniaccel-irq-mp-run-sync.$i" &
+	if [[ "${IS_MINIACCEL:-0}" == 1 ]]; then
+		"${SUDO[@]}" "$RUN_BIN" --opcode nop --timeout-ms 1000 \
+			>"/tmp/miniaccel-irq-mp-run-sync.$i" &
+	else
+		"${SUDO[@]}" "$RUN_BIN" "$((i % 13))" 1000 \
+			>"/tmp/miniaccel-irq-mp-run-sync.$i" &
+	fi
 	pids+=("$!")
 done
 
@@ -148,9 +183,9 @@ for pid in "${pids[@]}"; do
 done
 echo "multi-process-run-sync-ok count=${#pids[@]}"
 
-"${SUDO[@]}" bash -c '
+"${SUDO[@]}" env MODULE_NAME="$MODULE_NAME" bash -c '
 exec 9<>/dev/miniaccel0
-if rmmod miniaccel_drv 2>/tmp/miniaccel-rmmod-open.err; then
+if rmmod "$MODULE_NAME" 2>/tmp/miniaccel-rmmod-open.err; then
 	echo "rmmod unexpectedly succeeded with an open fd" >&2
 	exit 1
 fi

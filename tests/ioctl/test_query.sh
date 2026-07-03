@@ -4,7 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 DRIVER_DIR="${DRIVER_DIR:-$ROOT_DIR/driver/char}"
-MODULE_NAME="${MODULE_NAME:-miniaccel_drv}"
+if [[ -z "${MODULE_NAME:-}" ]]; then
+	MODULE_NAME="$("$ROOT_DIR/scripts/detect-driver-module.sh")"
+fi
 KO_PATH="${KO_PATH:-$DRIVER_DIR/$MODULE_NAME.ko}"
 INFO_BIN="${INFO_BIN:-/tmp/miniaccel-info-test}"
 
@@ -48,8 +50,14 @@ unload_module
 output="$("${SUDO[@]}" "$INFO_BIN")"
 echo "$output"
 
-grep -q "device_id=0x11e8" <<<"$output"
-grep -q "version=0x010000ed" <<<"$output"
+if grep -q "device_id=0xacc1" <<<"$output"; then
+	grep -q "version=0x00010000" <<<"$output"
+elif grep -q "device_id=0x11e8" <<<"$output"; then
+	grep -q "version=0x010000ed" <<<"$output"
+else
+	echo "unexpected device_id in QUERY output: $output" >&2
+	exit 1
+fi
 grep -q "capabilities=0x0000000000000001" <<<"$output"
 
 echo "query-ioctl-ok"

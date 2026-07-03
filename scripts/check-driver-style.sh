@@ -8,7 +8,10 @@ CHECKPATCH="$ROOT_DIR/tools/kernel/scripts/checkpatch.pl"
 if (($#)); then
 	FILES=("$@")
 else
-	FILES=("$ROOT_DIR/driver/char/miniaccel_drv.c")
+	FILES=(
+		"$ROOT_DIR/driver/char/miniaccel_drv.c"
+		"$ROOT_DIR/driver/char/miniaccel_edu_drv.c"
+	)
 fi
 
 git -C "$ROOT_DIR" diff --check

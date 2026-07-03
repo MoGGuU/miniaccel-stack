@@ -15,5 +15,5 @@ until "${SSH[@]}" 'cloud-init status --wait >/dev/null 2>&1' 2>/dev/null; do
   sleep 5
 done
 
-EDU_LINE="$("${SSH[@]}" "lspci -nn | grep -i '1234:11e8'")"
-echo "Guest is ready. EDU device: $EDU_LINE"
+DEVICE_LINE="$("${SSH[@]}" "lspci -nn | grep -Ei '1afe:acc1|1234:11e8' | head -1")"
+echo "Guest is ready. MiniAccel/EDU device: $DEVICE_LINE"

@@ -10,7 +10,13 @@ PID_FILE="$GUEST_DIR/qemu.pid"
 SERIAL_LOG="$GUEST_DIR/serial.log"
 MONITOR_SOCKET="$GUEST_DIR/monitor.sock"
 SSH_PORT="${SSH_PORT:-2222}"
-QEMU_SYSTEM_X86_64="${QEMU_SYSTEM_X86_64:-qemu-system-x86_64}"
+DEFAULT_QEMU_SYSTEM_X86_64="$ROOT_DIR/../miniaccel-qemu/build/qemu-system-x86_64"
+if [[ -z "${QEMU_SYSTEM_X86_64:-}" && -x "$DEFAULT_QEMU_SYSTEM_X86_64" ]]; then
+  QEMU_SYSTEM_X86_64="$DEFAULT_QEMU_SYSTEM_X86_64"
+else
+  QEMU_SYSTEM_X86_64="${QEMU_SYSTEM_X86_64:-qemu-system-x86_64}"
+fi
+MINIACCEL_QEMU_DEVICE="${MINIACCEL_QEMU_DEVICE:-miniaccel}"
 
 for file in "$ROOTFS" "$SEED_IMAGE"; do
   [[ -f "$file" ]] || {
@@ -32,7 +38,7 @@ rm -f "$PID_FILE" "$SERIAL_LOG" "$MONITOR_SOCKET"
   -cpu max \
   -smp 2 \
   -m 1024 \
-  -device edu \
+  -device "$MINIACCEL_QEMU_DEVICE" \
   -fsdev "local,id=miniaccel_fs,path=$ROOT_DIR,security_model=mapped-xattr" \
   -device "virtio-9p-pci,fsdev=miniaccel_fs,mount_tag=miniaccel" \
   -drive "file=$ROOTFS,if=virtio,format=qcow2" \

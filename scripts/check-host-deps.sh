@@ -28,10 +28,20 @@ EOF
   exit 1
 fi
 
-qemu-system-x86_64 -device help | grep -q 'name "edu"' || {
-  echo 'This QEMU build does not provide the EDU device.' >&2
-  exit 1
-}
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+CUSTOM_QEMU="$ROOT_DIR/../miniaccel-qemu/build/qemu-system-x86_64"
 
-echo "Host dependencies and QEMU EDU device are available."
-
+if [[ -x "$CUSTOM_QEMU" ]]; then
+  "$CUSTOM_QEMU" -device help | grep -q 'name "miniaccel"' || {
+    echo 'Custom QEMU build does not provide the miniaccel device.' >&2
+    exit 1
+  }
+  echo "Host dependencies and QEMU miniaccel device are available."
+else
+  qemu-system-x86_64 -device help | grep -q 'name "edu"' || {
+    echo 'System QEMU build does not provide the EDU fallback device.' >&2
+    exit 1
+  }
+  echo "Host dependencies and QEMU EDU fallback device are available."
+fi

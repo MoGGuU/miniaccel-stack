@@ -4,7 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 DRIVER_DIR="${DRIVER_DIR:-$ROOT_DIR/driver/char}"
-MODULE_NAME="${MODULE_NAME:-miniaccel_drv}"
+if [[ -z "${MODULE_NAME:-}" ]]; then
+	MODULE_NAME="$("$ROOT_DIR/scripts/detect-driver-module.sh")"
+fi
 BDF="${BDF:-00:02.0}"
 KO_PATH="${KO_PATH:-$DRIVER_DIR/$MODULE_NAME.ko}"
 
